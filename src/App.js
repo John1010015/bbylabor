@@ -7,7 +7,7 @@ const BB_YELLOW = "#FFD100";
 const LIGHT_BORDER = "#ddd";
 const BASE_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
-// how many past weeks to avoid repeating the same position
+// how many past weeks to avoid repeating the SAME position
 const LOOKBACK_WEEKS = 2;
 
 const positionsList = [
@@ -24,6 +24,7 @@ const positionsList = [
   "wrap",
 ];
 
+// “girls” list from earlier + Rocha (you told me to keep her out too)
 const restrictedNames = [
   "Johanna",
   "Imelda",
@@ -37,10 +38,7 @@ const restrictedNames = [
   "Rocha",
 ];
 
-const norm = (s) =>
-  String(s || "")
-    .trim()
-    .toLowerCase();
+const norm = (s) => String(s || "").trim().toLowerCase();
 const did = (pos, day) => `${pos}__${day}`;
 const parseDid = (id) => {
   const i = id.lastIndexOf("__");
@@ -77,28 +75,26 @@ const initialEmployees = [
   ...e,
 }));
 
-// was emp in this position in the last N weeks?
+// check if employee was in this position in last N weeks
 function wasInPositionRecently(empName, pos, history, lookback) {
   if (!history || history.length === 0) return false;
-  const recent = history.slice(-lookback); // last N schedules
+  const recent = history.slice(-lookback);
   for (const week of recent) {
     const posBlock = week[pos];
     if (!posBlock) continue;
     for (const dayKey of Object.keys(posBlock)) {
-      const list = posBlock[dayKey] || [];
-      if (list.some((e) => e.name === empName)) return true;
+      const arr = posBlock[dayKey] || [];
+      if (arr.some((e) => e.name === empName)) return true;
     }
   }
   return false;
 }
 
-// make sure counts object has every employee and every position
+// make sure counts has every employee + every position
 function ensureCountsShape(counts, employees) {
   const copy = { ...counts };
   employees.forEach((e) => {
-    if (!copy[e.name]) {
-      copy[e.name] = {};
-    }
+    if (!copy[e.name]) copy[e.name] = {};
     positionsList.forEach((p) => {
       if (typeof copy[e.name][p] !== "number") {
         copy[e.name][p] = 0;
@@ -123,7 +119,7 @@ export default function App() {
     [includeSaturday]
   );
 
-  // load from localStorage
+  // load
   useEffect(() => {
     setEmployees(JSON.parse(localStorage.getItem("employees")) || initialEmployees);
     setPositionNeeds(JSON.parse(localStorage.getItem("positionNeeds")) || {});
@@ -133,7 +129,7 @@ export default function App() {
     setIncludeSaturday(JSON.parse(localStorage.getItem("includeSaturday")) || false);
   }, []);
 
-  // save to localStorage
+  // save
   useEffect(() => {
     localStorage.setItem("employees", JSON.stringify(employees));
   }, [employees]);
@@ -159,6 +155,7 @@ export default function App() {
     setGeneratedOnce(false);
   };
 
+  // RESET CHART BUTTON handler
   const resetCounts = () => {
     setPositionCounts({});
     setScheduleHistory([]);
@@ -170,13 +167,11 @@ export default function App() {
     const daysActive = activeDays;
     const next = {};
 
-    // track who is already assigned on each day so we don't double-book
+    // track who is already on each day
     const dayTaken = {};
-    daysActive.forEach((d) => {
-      dayTaken[d] = new Set();
-    });
+    daysActive.forEach((d) => (dayTaken[d] = new Set()));
 
-    // initialize schedule shape
+    // init schedule shape
     for (const pos of positionsList) {
       next[pos] = {};
       for (const d of daysActive) next[pos][d] = [];
@@ -196,7 +191,7 @@ export default function App() {
     const maxNeed = (pos) =>
       Math.max(...daysActive.map((d) => positionNeeds[pos]?.[d] || 0), 0);
 
-    // assign every other position
+    // assign other positions
     for (const pos of shuffle([...positionsList])) {
       if (pos === "VAL") continue;
       const needed = maxNeed(pos);
@@ -204,7 +199,6 @@ export default function App() {
 
       const isAllowedBase = (e) => {
         const name = e.name?.trim();
-        // keep girls out of bulk/line loading
         if (
           ["bulk", "line loading"].includes(norm(pos)) &&
           restrictedNames.includes(name)
@@ -217,7 +211,7 @@ export default function App() {
       const isFreeAllDays = (e) =>
         daysActive.every((d) => !dayTaken[d].has(e.name));
 
-      // best candidates: allowed + free + not recently in this position
+      // best candidates
       let candidates = pool.filter(
         (e) =>
           isAllowedBase(e) &&
@@ -225,7 +219,7 @@ export default function App() {
           !wasInPositionRecently(e.name, pos, scheduleHistory, LOOKBACK_WEEKS)
       );
 
-      // if not enough, allow ones who were in it recently (but still free)
+      // relax if not enough
       if (candidates.length < needed) {
         const more = pool.filter((e) => isAllowedBase(e) && isFreeAllDays(e));
         more.forEach((m) => {
@@ -233,7 +227,7 @@ export default function App() {
         });
       }
 
-      // score by employee preference order
+      // score by preference
       const scored = candidates.map((e) => {
         const idx = e.positions.map(norm).indexOf(norm(pos));
         return { emp: e, score: idx === -1 ? 99 : idx };
@@ -242,23 +236,25 @@ export default function App() {
 
       const picked = scored.slice(0, needed).map((x) => x.emp);
 
-      // assign for all days and mark as taken
+      // assign for all days
       for (const d of daysActive) {
         next[pos][d] = [...picked];
         picked.forEach((p) => dayTaken[d].add(p.name));
       }
 
-      // remove from pool so we don't try to use them again in another position
+      // remove picked from pool
       pool = pool.filter((e) => !picked.some((p) => p.id === e.id));
     }
 
-    // fill leftover slots
+    // fill remaining
     const openSlots = [];
     for (const pos of positionsList) {
       for (const d of daysActive) {
         const need = positionNeeds[pos]?.[d] || 0;
         const current = next[pos][d].length;
-        if (current < need) openSlots.push({ pos, day: d, remaining: need - current });
+        if (current < need) {
+          openSlots.push({ pos, day: d, remaining: need - current });
+        }
       }
     }
 
@@ -280,33 +276,24 @@ export default function App() {
       }
     }
 
-    // update schedule
+    // save schedule
     setSchedule(next);
     setGeneratedOnce(true);
 
-    // save history as array of whole schedules (keep last 6)
+    // history (last 6)
     const newHistory = [...scheduleHistory, next].slice(-6);
     setScheduleHistory(newHistory);
 
-    // UPDATE COUNTS: +1 per employee per position per week
-    // build week record
-    const weekRecord = {};
-    positionsList.forEach((pos) => {
-      const daysObj = next[pos] || {};
-      const namesThisWeek = new Set();
-      Object.values(daysObj).forEach((arr) => {
-        (arr || []).forEach((emp) => namesThisWeek.add(emp.name));
-      });
-      namesThisWeek.forEach((name) => {
-        if (!weekRecord[name]) weekRecord[name] = {};
-        weekRecord[name][pos] = 1;
-      });
-    });
-
+    // counts: +1 per week per position (unique names per position)
     setPositionCounts((prev) => {
       const base = ensureCountsShape(prev, employees);
-      Object.entries(weekRecord).forEach(([name, posObj]) => {
-        Object.keys(posObj).forEach((pos) => {
+      positionsList.forEach((pos) => {
+        const daysObj = next[pos] || {};
+        const namesThisWeek = new Set();
+        Object.values(daysObj).forEach((arr) => {
+          (arr || []).forEach((emp) => namesThisWeek.add(emp.name));
+        });
+        namesThisWeek.forEach((name) => {
           base[name][pos] = (base[name][pos] || 0) + 1;
         });
       });
@@ -336,14 +323,13 @@ export default function App() {
     );
   };
 
-  // drag handler that also updates counts
+  // drag that also updates counts
   const handleDragEnd = (result) => {
     if (!result.destination) return;
     const { source, destination } = result;
     const src = parseDid(source.droppableId);
     const dst = parseDid(destination.droppableId);
 
-    // same place → nothing
     if (
       src.pos === dst.pos &&
       src.day === dst.day &&
@@ -352,12 +338,10 @@ export default function App() {
       return;
     }
 
-    // clone schedule
     const next = JSON.parse(JSON.stringify(schedule));
     const moved = next[src.pos][src.day].splice(source.index, 1)[0];
     if (!moved) return;
     next[dst.pos][dst.day].splice(destination.index, 0, moved);
-
     setSchedule(next);
 
     // if position changed, adjust counts
@@ -376,13 +360,10 @@ export default function App() {
     }
   };
 
-  // make sure chart has every employee/position
   const displayCounts = ensureCountsShape(positionCounts, employees);
 
   return (
-    <div
-      style={{ fontFamily: "Arial", background: "#f7f9fc", minHeight: "100vh" }}
-    >
+    <div style={{ fontFamily: "Arial", background: "#f7f9fc", minHeight: "100vh" }}>
       <Header tab={tab} setTab={setTab} />
       {tab === "roster" ? (
         <RosterTab employees={employees} setEmployees={setEmployees} />
@@ -403,7 +384,6 @@ export default function App() {
           resetCounts={resetCounts}
           generatedOnce={generatedOnce}
           schedule={schedule}
-          setSchedule={setSchedule}
           exportToExcel={exportToExcel}
           counts={displayCounts}
           onDragEnd={handleDragEnd}
@@ -430,10 +410,7 @@ function Header({ tab, setTab }) {
         <button onClick={() => setTab("roster")} style={tabBtn(tab === "roster")}>
           Employee Roster
         </button>
-        <button
-          onClick={() => setTab("schedule")}
-          style={tabBtn(tab === "schedule")}
-        >
+        <button onClick={() => setTab("schedule")} style={tabBtn(tab === "schedule")}>
           Schedule
         </button>
       </div>
@@ -613,6 +590,7 @@ function ScheduleTab({
 }) {
   return (
     <div style={{ padding: 20, maxWidth: 1200, margin: "0 auto" }}>
+      {/* top controls */}
       <div
         style={{
           display: "flex",
@@ -630,6 +608,7 @@ function ScheduleTab({
             Include Saturday
           </span>
         </label>
+
         <div style={{ display: "flex", gap: 10 }}>
           <button
             onClick={resetSchedule}
@@ -672,6 +651,7 @@ function ScheduleTab({
         </div>
       </div>
 
+      {/* position needs */}
       <h3 style={{ color: BB_BLUE }}>
         Set Position Needs ({includeSaturday ? "Mon–Sat" : "Mon–Fri"})
       </h3>
@@ -693,6 +673,7 @@ function ScheduleTab({
         </div>
       ))}
 
+      {/* schedule table */}
       {Object.keys(schedule).length > 0 && (
         <div style={{ marginTop: 20 }}>
           <div
@@ -800,6 +781,7 @@ function ScheduleTab({
         </div>
       )}
 
+      {/* chart */}
       <div style={{ marginTop: 30 }}>
         <h3 style={{ color: BB_BLUE }}>
           Position History (per week, per position)
