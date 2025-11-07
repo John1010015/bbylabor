@@ -48,7 +48,6 @@ const parseDid = (id) => {
 };
 const shuffle = (arr) => [...arr].sort(() => Math.random() - 0.5);
 
-// base employees
 const initialEmployees = [
   { name: "Denise", positions: ["Receiving", "Direct Sorting", "Re-pack"] },
   { name: "Imelda", positions: ["Belt", "Flow", "Direct Sorting"] },
@@ -93,37 +92,20 @@ function wasInPositionRecently(empName, pos, history, lookback) {
   return false;
 }
 
-// build a table: employee -> position -> how many weeks they did it
-function buildPositionCounts(employees, schedule, history) {
-  const counts = {};
-  // init all to 0
+// make sure counts object has every employee and every position
+function ensureCountsShape(counts, employees) {
+  const copy = { ...counts };
   employees.forEach((e) => {
-    counts[e.name] = {};
-    positionsList.forEach((p) => (counts[e.name][p] = 0));
-  });
-
-  const addWeek = (weekSchedule) => {
-    if (!weekSchedule) return;
-    positionsList.forEach((pos) => {
-      const daysObj = weekSchedule[pos] || {};
-      const namesThisWeek = new Set();
-      Object.values(daysObj).forEach((arr) => {
-        (arr || []).forEach((emp) => namesThisWeek.add(emp.name));
-      });
-      namesThisWeek.forEach((name) => {
-        if (!counts[name]) {
-          counts[name] = {};
-          positionsList.forEach((p) => (counts[name][p] = 0));
-        }
-        counts[name][pos] = (counts[name][pos] || 0) + 1; // +1 per week
-      });
+    if (!copy[e.name]) {
+      copy[e.name] = {};
+    }
+    positionsList.forEach((p) => {
+      if (typeof copy[e.name][p] !== "number") {
+        copy[e.name][p] = 0;
+      }
     });
-  };
-
-  (history || []).forEach(addWeek);
-  if (schedule && Object.keys(schedule).length) addWeek(schedule);
-
-  return counts;
+  });
+  return copy;
 }
 
 export default function App() {
@@ -132,6 +114,7 @@ export default function App() {
   const [positionNeeds, setPositionNeeds] = useState({});
   const [schedule, setSchedule] = useState({});
   const [scheduleHistory, setScheduleHistory] = useState([]);
+  const [positionCounts, setPositionCounts] = useState({});
   const [includeSaturday, setIncludeSaturday] = useState(false);
   const [generatedOnce, setGeneratedOnce] = useState(false);
 
@@ -146,6 +129,7 @@ export default function App() {
     setPositionNeeds(JSON.parse(localStorage.getItem("positionNeeds")) || {});
     setSchedule(JSON.parse(localStorage.getItem("schedule")) || {});
     setScheduleHistory(JSON.parse(localStorage.getItem("scheduleHistory")) || []);
+    setPositionCounts(JSON.parse(localStorage.getItem("positionCounts")) || {});
     setIncludeSaturday(JSON.parse(localStorage.getItem("includeSaturday")) || false);
   }, []);
 
@@ -163,6 +147,9 @@ export default function App() {
     localStorage.setItem("scheduleHistory", JSON.stringify(scheduleHistory));
   }, [scheduleHistory]);
   useEffect(() => {
+    localStorage.setItem("positionCounts", JSON.stringify(positionCounts));
+  }, [positionCounts]);
+  useEffect(() => {
     localStorage.setItem("includeSaturday", JSON.stringify(includeSaturday));
   }, [includeSaturday]);
 
@@ -170,6 +157,13 @@ export default function App() {
     setSchedule({});
     localStorage.removeItem("schedule");
     setGeneratedOnce(false);
+  };
+
+  const resetCounts = () => {
+    setPositionCounts({});
+    setScheduleHistory([]);
+    localStorage.removeItem("positionCounts");
+    localStorage.removeItem("scheduleHistory");
   };
 
   const generateSchedule = () => {
@@ -258,7 +252,7 @@ export default function App() {
       pool = pool.filter((e) => !picked.some((p) => p.id === e.id));
     }
 
-    // fill leftover slots with leftovers, still no double-book
+    // fill leftover slots
     const openSlots = [];
     for (const pos of positionsList) {
       for (const d of daysActive) {
@@ -286,6 +280,7 @@ export default function App() {
       }
     }
 
+    // update schedule
     setSchedule(next);
     setGeneratedOnce(true);
 
@@ -293,9 +288,33 @@ export default function App() {
     const newHistory = [...scheduleHistory, next].slice(-6);
     setScheduleHistory(newHistory);
 
+    // UPDATE COUNTS: +1 per employee per position per week
+    // build week record
+    const weekRecord = {};
+    positionsList.forEach((pos) => {
+      const daysObj = next[pos] || {};
+      const namesThisWeek = new Set();
+      Object.values(daysObj).forEach((arr) => {
+        (arr || []).forEach((emp) => namesThisWeek.add(emp.name));
+      });
+      namesThisWeek.forEach((name) => {
+        if (!weekRecord[name]) weekRecord[name] = {};
+        weekRecord[name][pos] = 1;
+      });
+    });
+
+    setPositionCounts((prev) => {
+      const base = ensureCountsShape(prev, employees);
+      Object.entries(weekRecord).forEach(([name, posObj]) => {
+        Object.keys(posObj).forEach((pos) => {
+          base[name][pos] = (base[name][pos] || 0) + 1;
+        });
+      });
+      return { ...base };
+    });
+
     localStorage.setItem("schedule", JSON.stringify(next));
     localStorage.setItem("scheduleHistory", JSON.stringify(newHistory));
-    setTab("schedule");
   };
 
   const exportToExcel = () => {
@@ -317,7 +336,48 @@ export default function App() {
     );
   };
 
-  const counts = buildPositionCounts(employees, schedule, scheduleHistory);
+  // drag handler that also updates counts
+  const handleDragEnd = (result) => {
+    if (!result.destination) return;
+    const { source, destination } = result;
+    const src = parseDid(source.droppableId);
+    const dst = parseDid(destination.droppableId);
+
+    // same place → nothing
+    if (
+      src.pos === dst.pos &&
+      src.day === dst.day &&
+      source.index === destination.index
+    ) {
+      return;
+    }
+
+    // clone schedule
+    const next = JSON.parse(JSON.stringify(schedule));
+    const moved = next[src.pos][src.day].splice(source.index, 1)[0];
+    if (!moved) return;
+    next[dst.pos][dst.day].splice(destination.index, 0, moved);
+
+    setSchedule(next);
+
+    // if position changed, adjust counts
+    if (src.pos !== dst.pos) {
+      setPositionCounts((prev) => {
+        const base = ensureCountsShape(prev, employees);
+        const name = moved.name;
+        // -1 from old if >0
+        if ((base[name][src.pos] || 0) > 0) {
+          base[name][src.pos] = base[name][src.pos] - 1;
+        }
+        // +1 to new
+        base[name][dst.pos] = (base[name][dst.pos] || 0) + 1;
+        return { ...base };
+      });
+    }
+  };
+
+  // make sure chart has every employee/position
+  const displayCounts = ensureCountsShape(positionCounts, employees);
 
   return (
     <div
@@ -340,11 +400,13 @@ export default function App() {
           }
           generateSchedule={generateSchedule}
           resetSchedule={resetSchedule}
+          resetCounts={resetCounts}
           generatedOnce={generatedOnce}
           schedule={schedule}
           setSchedule={setSchedule}
           exportToExcel={exportToExcel}
-          counts={counts}
+          counts={displayCounts}
+          onDragEnd={handleDragEnd}
         />
       )}
     </div>
@@ -542,24 +604,13 @@ function ScheduleTab({
   handleNeedChange,
   generateSchedule,
   resetSchedule,
+  resetCounts,
   generatedOnce,
   schedule,
-  setSchedule,
   exportToExcel,
   counts,
+  onDragEnd,
 }) {
-  const onDragEnd = (result) => {
-    const { source, destination } = result;
-    if (!destination) return;
-    const s = parseDid(source.droppableId);
-    const d = parseDid(destination.droppableId);
-    const next = JSON.parse(JSON.stringify(schedule));
-    const [moved] = next[s.pos][s.day].splice(source.index, 1);
-    if (!moved) return;
-    next[d.pos][d.day].splice(destination.index, 0, moved);
-    setSchedule(next);
-  };
-
   return (
     <div style={{ padding: 20, maxWidth: 1200, margin: "0 auto" }}>
       <div
@@ -591,7 +642,20 @@ function ScheduleTab({
               fontWeight: "bold",
             }}
           >
-            Reset
+            Reset Schedule
+          </button>
+          <button
+            onClick={resetCounts}
+            style={{
+              background: "white",
+              border: `1px solid ${LIGHT_BORDER}`,
+              color: "#c62828",
+              padding: "6px 10px",
+              borderRadius: 6,
+              fontWeight: "bold",
+            }}
+          >
+            Reset Chart
           </button>
           <button
             onClick={generateSchedule}
@@ -736,7 +800,6 @@ function ScheduleTab({
         </div>
       )}
 
-      {/* history / chart section */}
       <div style={{ marginTop: 30 }}>
         <h3 style={{ color: BB_BLUE }}>
           Position History (per week, per position)
