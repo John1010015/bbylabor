@@ -7,7 +7,7 @@ const BB_YELLOW = "#FFD100";
 const LIGHT_BORDER = "#ddd";
 const BASE_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
-// how many past weeks to block same position
+// how many past weeks to avoid repeating the same position
 const LOOKBACK_WEEKS = 2;
 
 const positionsList = [
@@ -37,7 +37,10 @@ const restrictedNames = [
   "Rocha",
 ];
 
-const norm = (s) => String(s || "").trim().toLowerCase();
+const norm = (s) =>
+  String(s || "")
+    .trim()
+    .toLowerCase();
 const did = (pos, day) => `${pos}__${day}`;
 const parseDid = (id) => {
   const i = id.lastIndexOf("__");
@@ -45,6 +48,7 @@ const parseDid = (id) => {
 };
 const shuffle = (arr) => [...arr].sort(() => Math.random() - 0.5);
 
+// base employees
 const initialEmployees = [
   { name: "Denise", positions: ["Receiving", "Direct Sorting", "Re-pack"] },
   { name: "Imelda", positions: ["Belt", "Flow", "Direct Sorting"] },
@@ -74,53 +78,50 @@ const initialEmployees = [
   ...e,
 }));
 
-// helper: was employee in this position in past weeks?
+// was emp in this position in the last N weeks?
 function wasInPositionRecently(empName, pos, history, lookback) {
   if (!history || history.length === 0) return false;
-  // check last N schedules
-  const recent = history.slice(-lookback);
-  for (const weekSchedule of recent) {
-    const posBlock = weekSchedule[pos];
+  const recent = history.slice(-lookback); // last N schedules
+  for (const week of recent) {
+    const posBlock = week[pos];
     if (!posBlock) continue;
-    // check any day in that week
     for (const dayKey of Object.keys(posBlock)) {
       const list = posBlock[dayKey] || [];
-      if (list.some((e) => e.name === empName)) {
-        return true;
-      }
+      if (list.some((e) => e.name === empName)) return true;
     }
   }
   return false;
 }
 
-// build counts from history + current
+// build a table: employee -> position -> how many weeks they did it
 function buildPositionCounts(employees, schedule, history) {
   const counts = {};
-  // initialize
+  // init all to 0
   employees.forEach((e) => {
     counts[e.name] = {};
     positionsList.forEach((p) => (counts[e.name][p] = 0));
   });
 
-  const addFromSchedule = (sch) => {
+  const addWeek = (weekSchedule) => {
+    if (!weekSchedule) return;
     positionsList.forEach((pos) => {
-      const days = sch[pos] || {};
-      Object.values(days).forEach((arr) => {
-        (arr || []).forEach((emp) => {
-          if (!counts[emp.name]) {
-            counts[emp.name] = {};
-            positionsList.forEach((p) => (counts[emp.name][p] = 0));
-          }
-          counts[emp.name][pos] = (counts[emp.name][pos] || 0) + 1;
-        });
+      const daysObj = weekSchedule[pos] || {};
+      const namesThisWeek = new Set();
+      Object.values(daysObj).forEach((arr) => {
+        (arr || []).forEach((emp) => namesThisWeek.add(emp.name));
+      });
+      namesThisWeek.forEach((name) => {
+        if (!counts[name]) {
+          counts[name] = {};
+          positionsList.forEach((p) => (counts[name][p] = 0));
+        }
+        counts[name][pos] = (counts[name][pos] || 0) + 1; // +1 per week
       });
     });
   };
 
-  // from history
-  (history || []).forEach(addFromSchedule);
-  // from current
-  if (schedule && Object.keys(schedule).length) addFromSchedule(schedule);
+  (history || []).forEach(addWeek);
+  if (schedule && Object.keys(schedule).length) addWeek(schedule);
 
   return counts;
 }
@@ -139,7 +140,7 @@ export default function App() {
     [includeSaturday]
   );
 
-  // load
+  // load from localStorage
   useEffect(() => {
     setEmployees(JSON.parse(localStorage.getItem("employees")) || initialEmployees);
     setPositionNeeds(JSON.parse(localStorage.getItem("positionNeeds")) || {});
@@ -148,7 +149,7 @@ export default function App() {
     setIncludeSaturday(JSON.parse(localStorage.getItem("includeSaturday")) || false);
   }, []);
 
-  // save
+  // save to localStorage
   useEffect(() => {
     localStorage.setItem("employees", JSON.stringify(employees));
   }, [employees]);
@@ -174,23 +175,34 @@ export default function App() {
   const generateSchedule = () => {
     const daysActive = activeDays;
     const next = {};
+
+    // track who is already assigned on each day so we don't double-book
+    const dayTaken = {};
+    daysActive.forEach((d) => {
+      dayTaken[d] = new Set();
+    });
+
+    // initialize schedule shape
     for (const pos of positionsList) {
       next[pos] = {};
       for (const d of daysActive) next[pos][d] = [];
     }
 
+    // VAL locked first
     const lockedVAL = employees.filter((e) => e.lockToVAL);
     let pool = shuffle(employees.filter((e) => !e.lockToVAL));
 
-    // put VAL locked in VAL for all days
     for (const e of lockedVAL) {
-      for (const d of daysActive) next["VAL"][d].push(e);
+      for (const d of daysActive) {
+        next["VAL"][d].push(e);
+        dayTaken[d].add(e.name);
+      }
     }
 
     const maxNeed = (pos) =>
       Math.max(...daysActive.map((d) => positionNeeds[pos]?.[d] || 0), 0);
 
-    // loop positions in random order
+    // assign every other position
     for (const pos of shuffle([...positionsList])) {
       if (pos === "VAL") continue;
       const needed = maxNeed(pos);
@@ -198,54 +210,61 @@ export default function App() {
 
       const isAllowedBase = (e) => {
         const name = e.name?.trim();
-        // no girls in bulk / line loading
+        // keep girls out of bulk/line loading
         if (
           ["bulk", "line loading"].includes(norm(pos)) &&
           restrictedNames.includes(name)
         )
           return false;
-        // manual exclusions
         if ((e.exclusions || []).map(norm).includes(norm(pos))) return false;
         return true;
       };
 
-      // 1) employees allowed AND not recently in this position
-      let preferred = pool.filter(
+      const isFreeAllDays = (e) =>
+        daysActive.every((d) => !dayTaken[d].has(e.name));
+
+      // best candidates: allowed + free + not recently in this position
+      let candidates = pool.filter(
         (e) =>
           isAllowedBase(e) &&
+          isFreeAllDays(e) &&
           !wasInPositionRecently(e.name, pos, scheduleHistory, LOOKBACK_WEEKS)
       );
 
-      // 2) if not enough, fall back to allowed regardless of recent
-      if (preferred.length < needed) {
-        const allowed = pool.filter((e) => isAllowedBase(e));
-        preferred = [...preferred, ...allowed.filter((x) => !preferred.includes(x))];
+      // if not enough, allow ones who were in it recently (but still free)
+      if (candidates.length < needed) {
+        const more = pool.filter((e) => isAllowedBase(e) && isFreeAllDays(e));
+        more.forEach((m) => {
+          if (!candidates.includes(m)) candidates.push(m);
+        });
       }
 
-      // 3) sort preferred by how much they actually prefer this position
-      const scored = preferred.map((e) => {
+      // score by employee preference order
+      const scored = candidates.map((e) => {
         const idx = e.positions.map(norm).indexOf(norm(pos));
         return { emp: e, score: idx === -1 ? 99 : idx };
       });
       scored.sort((a, b) => a.score - b.score);
 
-      const pick = scored.slice(0, needed).map((x) => x.emp);
+      const picked = scored.slice(0, needed).map((x) => x.emp);
 
-      // remove picked from pool
-      pool = pool.filter((e) => !pick.some((p) => p.id === e.id));
+      // assign for all days and mark as taken
+      for (const d of daysActive) {
+        next[pos][d] = [...picked];
+        picked.forEach((p) => dayTaken[d].add(p.name));
+      }
 
-      for (const d of daysActive) next[pos][d] = [...pick];
+      // remove from pool so we don't try to use them again in another position
+      pool = pool.filter((e) => !picked.some((p) => p.id === e.id));
     }
 
-    // fill leftover open slots with remaining pool
+    // fill leftover slots with leftovers, still no double-book
     const openSlots = [];
     for (const pos of positionsList) {
       for (const d of daysActive) {
         const need = positionNeeds[pos]?.[d] || 0;
         const current = next[pos][d].length;
-        if (current < need) {
-          openSlots.push({ pos, day: d, remaining: need - current });
-        }
+        if (current < need) openSlots.push({ pos, day: d, remaining: need - current });
       }
     }
 
@@ -253,7 +272,7 @@ export default function App() {
     for (const emp of leftovers) {
       for (const slot of openSlots) {
         if (slot.remaining <= 0) continue;
-        // still respect no girls in bulk/line loading
+        if (dayTaken[slot.day].has(emp.name)) continue;
         if (
           ["bulk", "line loading"].includes(norm(slot.pos)) &&
           restrictedNames.includes(emp.name?.trim())
@@ -261,6 +280,7 @@ export default function App() {
           continue;
         if ((emp.exclusions || []).map(norm).includes(norm(slot.pos))) continue;
         next[slot.pos][slot.day].push(emp);
+        dayTaken[slot.day].add(emp.name);
         slot.remaining -= 1;
         break;
       }
@@ -269,7 +289,7 @@ export default function App() {
     setSchedule(next);
     setGeneratedOnce(true);
 
-    // save history (keep last 6)
+    // save history as array of whole schedules (keep last 6)
     const newHistory = [...scheduleHistory, next].slice(-6);
     setScheduleHistory(newHistory);
 
@@ -300,7 +320,9 @@ export default function App() {
   const counts = buildPositionCounts(employees, schedule, scheduleHistory);
 
   return (
-    <div style={{ fontFamily: "Arial", background: "#f7f9fc", minHeight: "100vh" }}>
+    <div
+      style={{ fontFamily: "Arial", background: "#f7f9fc", minHeight: "100vh" }}
+    >
       <Header tab={tab} setTab={setTab} />
       {tab === "roster" ? (
         <RosterTab employees={employees} setEmployees={setEmployees} />
@@ -346,7 +368,10 @@ function Header({ tab, setTab }) {
         <button onClick={() => setTab("roster")} style={tabBtn(tab === "roster")}>
           Employee Roster
         </button>
-        <button onClick={() => setTab("schedule")} style={tabBtn(tab === "schedule")}>
+        <button
+          onClick={() => setTab("schedule")}
+          style={tabBtn(tab === "schedule")}
+        >
           Schedule
         </button>
       </div>
@@ -408,7 +433,9 @@ function RosterTab({ employees, setEmployees }) {
         </button>
       </div>
 
-      <table style={{ width: "100%", borderCollapse: "collapse", marginTop: 10 }}>
+      <table
+        style={{ width: "100%", borderCollapse: "collapse", marginTop: 10 }}
+      >
         <thead style={{ background: BB_BLUE, color: "white" }}>
           <tr>
             <th>Name</th>
@@ -535,14 +562,22 @@ function ScheduleTab({
 
   return (
     <div style={{ padding: 20, maxWidth: 1200, margin: "0 auto" }}>
-      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 12 }}>
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          marginBottom: 12,
+        }}
+      >
         <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <input
             type="checkbox"
             checked={includeSaturday}
             onChange={(e) => setIncludeSaturday(e.target.checked)}
           />
-          <span style={{ fontWeight: 700, color: BB_BLUE }}>Include Saturday</span>
+          <span style={{ fontWeight: 700, color: BB_BLUE }}>
+            Include Saturday
+          </span>
         </label>
         <div style={{ display: "flex", gap: 10 }}>
           <button
@@ -577,7 +612,10 @@ function ScheduleTab({
         Set Position Needs ({includeSaturday ? "Mon–Sat" : "Mon–Fri"})
       </h3>
       {positionsList.map((pos) => (
-        <div key={pos} style={{ display: "flex", alignItems: "center", marginBottom: 5 }}>
+        <div
+          key={pos}
+          style={{ display: "flex", alignItems: "center", marginBottom: 5 }}
+        >
           <strong style={{ width: 150 }}>{pos}</strong>
           {activeDays.map((d) => (
             <input
@@ -600,7 +638,9 @@ function ScheduleTab({
               alignItems: "center",
             }}
           >
-            <h3 style={{ color: BB_BLUE }}>Weekly Schedule — Drag names to adjust</h3>
+            <h3 style={{ color: BB_BLUE }}>
+              Weekly Schedule — Drag names to adjust
+            </h3>
             <button
               onClick={exportToExcel}
               style={{
@@ -636,7 +676,9 @@ function ScheduleTab({
                 {positionsList.map((pos) => (
                   <tr key={pos}>
                     <td>
-                      <strong style={{ textTransform: "capitalize" }}>{pos}</strong>
+                      <strong style={{ textTransform: "capitalize" }}>
+                        {pos}
+                      </strong>
                     </td>
                     {activeDays.map((day) => (
                       <td key={day}>
@@ -694,14 +736,17 @@ function ScheduleTab({
         </div>
       )}
 
-      {/* position history table */}
+      {/* history / chart section */}
       <div style={{ marginTop: 30 }}>
-        <h3 style={{ color: BB_BLUE }}>Position History (all weeks saved)</h3>
+        <h3 style={{ color: BB_BLUE }}>
+          Position History (per week, per position)
+        </h3>
         <div style={{ overflowX: "auto" }}>
           <table
             style={{
               borderCollapse: "collapse",
               minWidth: 600,
+              background: "#fff",
             }}
           >
             <thead>
@@ -724,7 +769,13 @@ function ScheduleTab({
                 .sort()
                 .map((name) => (
                   <tr key={name}>
-                    <td style={{ border: `1px solid ${LIGHT_BORDER}`, padding: 6 }}>
+                    <td
+                      style={{
+                        border: `1px solid ${LIGHT_BORDER}`,
+                        padding: 6,
+                        fontWeight: 600,
+                      }}
+                    >
                       {name}
                     </td>
                     {positionsList.map((pos) => (
