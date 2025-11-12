@@ -7,10 +7,14 @@ const BB_BLUE = "#0046BE";
 const BB_YELLOW = "#FFD100";
 const LIGHT_BORDER = "#ddd";
 const BASE_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+/** Special rows (not counted, no needs) */
+const UNASSIGNED = "unassigned";
 const OFF_POS = "off/other";
 
-/** Positions displayed (OFF/OTHER last) */
+/** Positions displayed (Unassigned first, OFF/OTHER last) */
 const positionsList = [
+  UNASSIGNED,
   "belt",
   "bulk",
   "direct sorting",
@@ -121,7 +125,7 @@ function blankCountsFor(employees) {
   employees.forEach((e) => {
     obj[e.name] = {};
     positionsList.forEach((p) => {
-      if (p === OFF_POS) return;
+      if (p === OFF_POS || p === UNASSIGNED) return;
       obj[e.name][p] = 0;
     });
   });
@@ -133,7 +137,7 @@ function ensureCountsShape(prev, employees) {
   employees.forEach((e) => {
     if (!next[e.name]) next[e.name] = {};
     positionsList.forEach((p) => {
-      if (p === OFF_POS) return;
+      if (p === OFF_POS || p === UNASSIGNED) return;
       if (typeof next[e.name][p] !== "number") next[e.name][p] = 0;
     });
   });
@@ -206,7 +210,7 @@ export default function App() {
   };
   const resetChart = () => setPositionCounts(blankCountsFor(employees));
 
-  /** Core generation: respects skillsByName when choosing candidates */
+  /** Core generation: respects skillsByName; extra people go to UNASSIGNED per day */
   const generateSchedule = () => {
     const daysActive = activeDays;
     const next = {};
@@ -215,9 +219,9 @@ export default function App() {
       for (const d of daysActive) next[pos][d] = [];
     }
 
+    // Lock VAL first
     const lockedVAL = employees.filter((e) => e.lockToVAL);
     let pool = shuffle(employees.filter((e) => !e.lockToVAL));
-
     for (const e of lockedVAL) {
       for (const d of daysActive) next["VAL"][d].push(e);
     }
@@ -225,8 +229,9 @@ export default function App() {
     const maxNeed = (pos) =>
       Math.max(...daysActive.map((d) => positionNeeds[pos]?.[d] || 0), 0);
 
+    // Fill needs (skip VAL, UNASSIGNED, OFF_POS)
     for (const pos of shuffle([...positionsList])) {
-      if (pos === "VAL" || pos === OFF_POS) continue;
+      if (pos === "VAL" || pos === OFF_POS || pos === UNASSIGNED) continue;
       const needed = maxNeed(pos);
       if (!needed) continue;
 
@@ -258,7 +263,6 @@ export default function App() {
           (e) =>
             isAllowed(e) &&
             (
-              // soft preference (1st/2nd/3rd) still used as a preference
               norm(e.positions[0]) === norm(pos) ||
               norm(e.positions[1]) === norm(pos) ||
               norm(e.positions[2]) === norm(pos) ||
@@ -277,10 +281,10 @@ export default function App() {
       for (const d of daysActive) next[pos][d] = [...pick];
     }
 
-    // Fill remaining needs with leftovers, still respecting skills
+    // Fill remaining needs with leftovers (skills-aware)
     const openSlots = [];
     for (const pos of positionsList) {
-      if (pos === OFF_POS) continue;
+      if (pos === OFF_POS || pos === UNASSIGNED) continue;
       for (const d of daysActive) {
         const need = positionNeeds[pos]?.[d] || 0;
         const current = next[pos][d].length;
@@ -291,9 +295,9 @@ export default function App() {
     const leftovers = shuffle(pool);
     for (const emp of leftovers) {
       const row = skillsByName[norm(emp.name)];
+      let placed = false;
       for (const slot of openSlots) {
         if (slot.remaining <= 0) continue;
-        // skills check for leftovers
         const allowedBySkills =
           !row ||
           !Object.prototype.hasOwnProperty.call(row, slot.pos) ||
@@ -309,7 +313,12 @@ export default function App() {
 
         next[slot.pos][slot.day].push(emp);
         slot.remaining -= 1;
+        placed = true;
         break;
+      }
+      // not placed anywhere -> goes to UNASSIGNED pool for every day
+      if (!placed) {
+        for (const d of daysActive) next[UNASSIGNED][d].push(emp);
       }
     }
 
@@ -317,7 +326,7 @@ export default function App() {
     setPositionCounts((prev) => {
       const base = ensureCountsShape(prev, employees);
       positionsList.forEach((pos) => {
-        if (pos === OFF_POS) return;
+        if (pos === OFF_POS || pos === UNASSIGNED) return;
         const namesThisWeek = new Set();
         Object.values(next[pos] || {}).forEach((arr) =>
           (arr || []).forEach((emp) => namesThisWeek.add(emp.name))
@@ -334,7 +343,9 @@ export default function App() {
     setTab("schedule");
   };
 
-  /** Drag: move + adjust counts when pos changes */
+  /** Drag: move + adjust counts when pos changes
+   * UNASSIGNED and OFF/OTHER never increment; moving out of a counted pos decrements
+   */
   const handleDragEnd = (result) => {
     const { source, destination } = result;
     if (!destination) return;
@@ -355,9 +366,10 @@ export default function App() {
       setPositionCounts((prev) => {
         const base = ensureCountsShape(prev, employees);
         const name = moved.name;
-        if (s.pos !== OFF_POS && base[name][s.pos] > 0)
+        const counted = (p) => p !== OFF_POS && p !== UNASSIGNED;
+        if (counted(s.pos) && base[name][s.pos] > 0)
           base[name][s.pos] = base[name][s.pos] - 1;
-        if (d.pos !== OFF_POS)
+        if (counted(d.pos))
           base[name][d.pos] = (base[name][d.pos] || 0) + 1;
         return { ...base };
       });
@@ -512,7 +524,7 @@ function RosterTab({ employees, setEmployees, onImportSkills }) {
         const skillMap = {};
         for (const k of keys) {
           const target = headerToPosition(k);
-          if (!target || target === OFF_POS) continue;
+          if (!target || target === OFF_POS || target === UNASSIGNED) continue;
           const b = toBoolLike(r[k]);
           if (b === null) continue; // unknown -> ignore
           skillMap[target] = b;
@@ -747,7 +759,7 @@ function ScheduleTab({
             checked={includeSaturday}
             onChange={(e) => setIncludeSaturday(e.target.checked)}
           />
-          <span style={{ fontWeight: 700, color: BB_BLUE }}>Include Saturday</span>
+        <span style={{ fontWeight: 700, color: BB_BLUE }}>Include Saturday</span>
         </label>
         <div style={{ display: "flex", gap: 10 }}>
           <button
@@ -795,7 +807,7 @@ function ScheduleTab({
         Set Position Needs ({includeSaturday ? "Mon–Sat" : "Mon–Fri"})
       </h3>
       {positionsList
-        .filter((p) => p !== OFF_POS)
+        .filter((p) => p !== OFF_POS && p !== UNASSIGNED)
         .map((pos) => (
           <div
             key={pos}
@@ -824,7 +836,7 @@ function ScheduleTab({
             }}
           >
             <h3 style={{ color: BB_BLUE }}>
-              Weekly Schedule — Drag names to adjust (OFF/OTHER available)
+              Weekly Schedule — Drag names to adjust (Unassigned + OFF/OTHER available)
             </h3>
             <button
               onClick={exportToExcel}
@@ -875,7 +887,12 @@ function ScheduleTab({
                                 border: `1px solid ${LIGHT_BORDER}`,
                                 borderRadius: 4,
                                 padding: 4,
-                                background: pos === OFF_POS ? "#fff9f0" : "#fff",
+                                background:
+                                  pos === OFF_POS
+                                    ? "#fff9f0"
+                                    : pos === UNASSIGNED
+                                    ? "#eef6ff"
+                                    : "#fff",
                               }}
                             >
                               {(schedule[pos]?.[day] || []).map((emp, idx) => (
@@ -932,7 +949,7 @@ function ScheduleTab({
                     Employee
                   </th>
                   {positionsList
-                    .filter((p) => p !== OFF_POS)
+                    .filter((p) => p !== OFF_POS && p !== UNASSIGNED)
                     .map((p) => (
                       <th
                         key={p}
@@ -955,7 +972,7 @@ function ScheduleTab({
                       {name}
                     </td>
                     {positionsList
-                      .filter((p) => p !== OFF_POS)
+                      .filter((p) => p !== OFF_POS && p !== UNASSIGNED)
                       .map((p) => (
                         <td
                           key={p}
