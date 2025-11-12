@@ -8,7 +8,7 @@ const BB_YELLOW = "#FFD100";
 const LIGHT_BORDER = "#ddd";
 const BASE_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
-/** New special bucket */
+/** Special drag-only bucket */
 const OFF_POS = "off/other";
 
 /** Positions shown in the schedule (OFF/OTHER last) */
@@ -24,10 +24,10 @@ const positionsList = [
   "trade in",
   "VAL",
   "wrap",
-  OFF_POS, // <— drag-only bucket
+  OFF_POS,
 ];
 
-/** People who should NOT be placed in bulk / line loading automatically */
+/** People who should NOT be auto-placed in bulk / line loading */
 const restrictedNames = [
   "Johanna",
   "Imelda",
@@ -79,13 +79,13 @@ const initialEmployees = [
   ...e,
 }));
 
-/* ---------- Utility for position counts ---------- */
+/* ---------- Position counts helpers ---------- */
 function blankCountsFor(employees) {
   const obj = {};
   employees.forEach((e) => {
     obj[e.name] = {};
     positionsList.forEach((p) => {
-      if (p === OFF_POS) return; // we don't count OFF/OTHER
+      if (p === OFF_POS) return;
       obj[e.name][p] = 0;
     });
   });
@@ -112,14 +112,14 @@ export default function App() {
   const [schedule, setSchedule] = useState({});
   const [includeSaturday, setIncludeSaturday] = useState(false);
   const [generatedOnce, setGeneratedOnce] = useState(false);
-  const [positionCounts, setPositionCounts] = useState({}); // per-employee weekly counts
+  const [positionCounts, setPositionCounts] = useState({});
 
   const activeDays = useMemo(
     () => (includeSaturday ? BASE_DAYS : BASE_DAYS.slice(0, 5)),
     [includeSaturday]
   );
 
-  /* ---------- Load from localStorage ---------- */
+  /* ---------- Load ---------- */
   useEffect(() => {
     setEmployees(
       JSON.parse(localStorage.getItem("employees")) || initialEmployees
@@ -189,13 +189,12 @@ export default function App() {
   const generateSchedule = () => {
     const daysActive = activeDays;
     const next = {};
-    // initialize empty buckets for all positions/days (OFF included)
     for (const pos of positionsList) {
       next[pos] = {};
       for (const d of daysActive) next[pos][d] = [];
     }
 
-    // lock VAL people first
+    // lock VAL first
     const lockedVAL = employees.filter((e) => e.lockToVAL);
     let pool = shuffle(employees.filter((e) => !e.lockToVAL));
     for (const e of lockedVAL) {
@@ -205,7 +204,7 @@ export default function App() {
     const maxNeed = (pos) =>
       Math.max(...daysActive.map((d) => positionNeeds[pos]?.[d] || 0), 0);
 
-    // fill positions by need (skip VAL + OFF_POS)
+    // fill positions (skip VAL and OFF_POS)
     for (const pos of shuffle([...positionsList])) {
       if (pos === "VAL" || pos === OFF_POS) continue;
       const needed = maxNeed(pos);
@@ -243,15 +242,14 @@ export default function App() {
       for (const d of daysActive) next[pos][d] = [...pick];
     }
 
-    // fill open slots with leftovers (still skip OFF_POS)
+    // fill open slots with leftovers (skip OFF_POS)
     const openSlots = [];
     for (const pos of positionsList) {
       if (pos === OFF_POS) continue;
       for (const d of daysActive) {
         const need = positionNeeds[pos]?.[d] || 0;
-        const current = next[pos][d].length;
-        if (current < need)
-          openSlots.push({ pos, day: d, remaining: need - current });
+        const cur = next[pos][d].length;
+        if (cur < need) openSlots.push({ pos, day: d, remaining: need - cur });
       }
     }
     const leftovers = shuffle(pool);
@@ -270,8 +268,7 @@ export default function App() {
       }
     }
 
-    // Update weekly positionCounts: each employee gets +1 for each position
-    // they appear in during this generated week (OFF/OTHER ignored)
+    // weekly positionCounts (+1 per position that week; OFF ignored)
     setPositionCounts((prev) => {
       const base = ensureCountsShape(prev, employees);
       positionsList.forEach((pos) => {
@@ -292,10 +289,10 @@ export default function App() {
     setTab("schedule");
   };
 
-  /* When manual drag ends: move item + adjust counts if pos changed
-     (OFF/OTHER never increments; leaving a real position decrements if >0) */
+  /* Drag & drop: move, then adjust counts if position changed
+     (OFF/OTHER doesn’t count; leaving a real pos decrements if >0) */
   const handleDragEnd = (result) => {
-    const { source, destination, draggableId } = result;
+    const { source, destination } = result;
     if (!destination) return;
 
     const s = parseDid(source.droppableId);
@@ -306,7 +303,7 @@ export default function App() {
     const [moved] = next[s.pos][s.day].splice(source.index, 1);
     if (!moved) return;
 
-    // ensure unique draggable id across cells
+    // unique id per cell placement
     const uid = `${moved.id}-${d.pos}-${d.day}-${Date.now()}`;
     next[d.pos][d.day].splice(destination.index, 0, { ...moved, _uid: uid });
 
@@ -317,11 +314,9 @@ export default function App() {
         const base = ensureCountsShape(prev, employees);
         const name = moved.name;
 
-        // decrement from old pos only if it's a real counted pos
         if (s.pos !== OFF_POS && base[name][s.pos] > 0) {
           base[name][s.pos] = base[name][s.pos] - 1;
         }
-        // increment to new pos only if it's a real counted pos
         if (d.pos !== OFF_POS) {
           base[name][d.pos] = (base[name][d.pos] || 0) + 1;
         }
@@ -458,7 +453,7 @@ function RosterTab({ employees, setEmployees }) {
             <tr key={e.id}>
               <td>{e.name}</td>
               {e.positions.map((p, i) => (
-                <td key={i}>
+                <td key={`${e.id}-pos-${i}`}>
                   <input
                     value={p}
                     onChange={(ev) => {
@@ -557,7 +552,6 @@ function ScheduleTab({
   resetChart,
   generatedOnce,
   schedule,
-  setSchedule,
   exportToExcel,
   onDragEnd,
   positionCounts,
@@ -630,13 +624,13 @@ function ScheduleTab({
         .filter((p) => p !== OFF_POS)
         .map((pos) => (
           <div
-            key={pos}
+            key={`need-${pos}`}
             style={{ display: "flex", alignItems: "center", marginBottom: 5 }}
           >
             <strong style={{ width: 150, textTransform: "capitalize" }}>{pos}</strong>
             {activeDays.map((d) => (
               <input
-                key={d}
+                key={`need-${pos}-${d}`}
                 type="number"
                 value={positionNeeds[pos]?.[d] || ""}
                 onChange={(e) => handleNeedChange(pos, d, e.target.value)}
@@ -686,18 +680,18 @@ function ScheduleTab({
                 <tr>
                   <th style={{ width: 150 }}>Position</th>
                   {activeDays.map((d) => (
-                    <th key={d}>{d}</th>
+                    <th key={`day-${d}`}>{d}</th>
                   ))}
                 </tr>
               </thead>
               <tbody>
                 {positionsList.map((pos) => (
-                  <tr key={pos}>
+                  <tr key={`row-${pos}`}>
                     <td>
                       <strong style={{ textTransform: "capitalize" }}>{pos}</strong>
                     </td>
                     {activeDays.map((day) => (
-                      <td key={day}>
+                      <td key={`cell-${pos}-${day}`}>
                         <Droppable droppableId={did(pos, day)}>
                           {(provided) => (
                             <div
@@ -711,33 +705,37 @@ function ScheduleTab({
                                 background: pos === OFF_POS ? "#fff9f0" : "#fff",
                               }}
                             >
-                              {(schedule[pos]?.[day] || []).map((emp, idx) => (
-                                <Draggable
-                                  key={(emp._uid ?? `${emp.id}-${pos}-${day}-${idx}`)}
-                                  draggableId={(emp._uid ?? `${emp.id}-${pos}-${day}-${idx}`)}
-                                  index={idx}
-                                >
-                                  {(prov) => (
-                                    <div
-                                      ref={prov.innerRef}
-                                      {...prov.draggableProps}
-                                      {...prov.dragHandleProps}
-                                      style={{
-                                        ...prov.draggableProps.style,
-                                        padding: "4px 6px",
-                                        marginBottom: 4,
-                                        background: "#f5f7ff",
-                                        border: `1px solid ${LIGHT_BORDER}`,
-                                        borderRadius: 4,
-                                        cursor: "grab",
-                                        fontSize: 13,
-                                      }}
-                                    >
-                                      {emp.name}
-                                    </div>
-                                  )}
-                                </Draggable>
-                              ))}
+                              {(schedule[pos]?.[day] || []).map((emp, idx) => {
+                                const dragId =
+                                  emp._uid ?? `${emp.id}-${pos}-${day}-${idx}`;
+                                return (
+                                  <Draggable
+                                    key={`drag-${dragId}`}
+                                    draggableId={dragId}
+                                    index={idx}
+                                  >
+                                    {(prov) => (
+                                      <div
+                                        ref={prov.innerRef}
+                                        {...prov.draggableProps}
+                                        {...prov.dragHandleProps}
+                                        style={{
+                                          ...prov.draggableProps.style,
+                                          padding: "4px 6px",
+                                          marginBottom: 4,
+                                          background: "#f5f7ff",
+                                          border: `1px solid ${LIGHT_BORDER}`,
+                                          borderRadius: 4,
+                                          cursor: "grab",
+                                          fontSize: 13,
+                                        }}
+                                      >
+                                        {emp.name}
+                                      </div>
+                                    )}
+                                  </Draggable>
+                                );
+                              })}
                               {provided.placeholder}
                             </div>
                           )}
@@ -750,20 +748,26 @@ function ScheduleTab({
             </table>
           </DragDropContext>
 
-          {/* Simple counts table */}
+          {/* Counts table */}
           <h3 style={{ marginTop: 24, color: BB_BLUE }}>Position Counts (per week)</h3>
           <div style={{ overflowX: "auto" }}>
             <table style={{ width: "100%", borderCollapse: "collapse" }}>
               <thead>
                 <tr>
-                  <th style={{ textAlign: "left", padding: 6, borderBottom: `1px solid ${LIGHT_BORDER}` }}>
+                  <th
+                    style={{
+                      textAlign: "left",
+                      padding: 6,
+                      borderBottom: `1px solid ${LIGHT_BORDER}`,
+                    }}
+                  >
                     Employee
                   </th>
                   {positionsList
                     .filter((p) => p !== OFF_POS)
                     .map((p) => (
                       <th
-                        key={p}
+                        key={`hdr-count-${p}`}
                         style={{
                           textAlign: "center",
                           padding: 6,
@@ -778,7 +782,7 @@ function ScheduleTab({
               </thead>
               <tbody>
                 {Object.keys(positionCounts).map((name) => (
-                  <tr key={name}>
+                  <tr key={`row-count-${name}`}>
                     <td style={{ padding: 6, borderBottom: `1px solid ${LIGHT_BORDER}` }}>
                       {name}
                     </td>
@@ -786,7 +790,7 @@ function ScheduleTab({
                       .filter((p) => p !== OFF_POS)
                       .map((p) => (
                         <td
-                          key={p}
+                          key={`cell-count-${name}-${p}`}
                           style={{
                             textAlign: "center",
                             padding: 6,
