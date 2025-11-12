@@ -7,11 +7,9 @@ const BB_BLUE = "#0046BE";
 const BB_YELLOW = "#FFD100";
 const LIGHT_BORDER = "#ddd";
 const BASE_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-
-/** Special drag-only bucket */
 const OFF_POS = "off/other";
 
-/** Positions shown in the schedule (OFF/OTHER last) */
+/** Positions displayed (OFF/OTHER last) */
 const positionsList = [
   "belt",
   "bulk",
@@ -27,7 +25,7 @@ const positionsList = [
   OFF_POS,
 ];
 
-/** People who should NOT be auto-placed in bulk / line loading */
+/** People who should NOT be placed in bulk / line loading automatically */
 const restrictedNames = [
   "Johanna",
   "Imelda",
@@ -48,6 +46,44 @@ const parseDid = (id) => {
   return { pos: id.slice(0, i), day: id.slice(i + 2) };
 };
 const shuffle = (arr) => [...arr].sort(() => Math.random() - 0.5);
+
+/* yes/no/1/0 parser */
+const toBoolLike = (v) => {
+  const s = String(v ?? "").trim().toLowerCase();
+  if (["y", "yes", "true", "1"].includes(s)) return true;
+  if (["n", "no", "false", "0"].includes(s)) return false;
+  return null; // unknown -> treat as missing (allowed)
+};
+
+/* Map messy headers to canonical position keys used in app */
+function headerToPosition(rawHeader) {
+  const nk = String(rawHeader || "")
+    .replace(/\u00A0/g, " ") // kill non-breaking spaces
+    .trim()
+    .toLowerCase()
+    .replace(/[_-]+/g, " ");
+
+  const canon = {
+    "belt": "belt",
+    "bulk": "bulk",
+    "direct sorting": "direct sorting",
+    "flow": "flow",
+    "line loading": "line loading",
+    "receiving": "receiving",
+    "repack": "repack",
+    "research": "research",
+    "trade in": "trade in",
+    "val": "VAL",
+    "wrap": "wrap",
+  };
+
+  if (nk.startsWith("direct sor")) return "direct sorting";
+  if (nk.startsWith("trade in")) return "trade in";
+  if (nk.startsWith("line load")) return "line loading";
+  if (nk === "val") return "VAL";
+
+  return canon[nk] || null;
+}
 
 /* ---------- Seed Employees ---------- */
 const initialEmployees = [
@@ -113,6 +149,8 @@ export default function App() {
   const [includeSaturday, setIncludeSaturday] = useState(false);
   const [generatedOnce, setGeneratedOnce] = useState(false);
   const [positionCounts, setPositionCounts] = useState({});
+  /** skillsByName: { [lowerName]: { [position]: true/false } } */
+  const [skillsByName, setSkillsByName] = useState({});
 
   const activeDays = useMemo(
     () => (includeSaturday ? BASE_DAYS : BASE_DAYS.slice(0, 5)),
@@ -130,6 +168,7 @@ export default function App() {
       JSON.parse(localStorage.getItem("includeSaturday")) || false
     );
     setPositionCounts(JSON.parse(localStorage.getItem("positionCounts")) || {});
+    setSkillsByName(JSON.parse(localStorage.getItem("skillsByName")) || {});
   }, []);
 
   /* ---------- Persist ---------- */
@@ -151,9 +190,12 @@ export default function App() {
     [includeSaturday]
   );
   useEffect(
-    () =>
-      localStorage.setItem("positionCounts", JSON.stringify(positionCounts)),
+    () => localStorage.setItem("positionCounts", JSON.stringify(positionCounts)),
     [positionCounts]
+  );
+  useEffect(
+    () => localStorage.setItem("skillsByName", JSON.stringify(skillsByName)),
+    [skillsByName]
   );
 
   /* ---------- Actions ---------- */
@@ -162,30 +204,9 @@ export default function App() {
     localStorage.removeItem("schedule");
     setGeneratedOnce(false);
   };
+  const resetChart = () => setPositionCounts(blankCountsFor(employees));
 
-  const resetChart = () => {
-    setPositionCounts(blankCountsFor(employees));
-  };
-
-  const exportToExcel = () => {
-    const wsData = [["Position", ...activeDays]];
-    positionsList.forEach((pos) => {
-      wsData.push([
-        pos,
-        ...activeDays.map((d) =>
-          (schedule[pos]?.[d] || []).map((e) => e.name).join(", ")
-        ),
-      ]);
-    });
-    const ws = XLSX.utils.aoa_to_sheet(wsData);
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, "Weekly Schedule");
-    XLSX.writeFile(
-      wb,
-      `Weekly_Schedule_${new Date().toISOString().split("T")[0]}.xlsx`
-    );
-  };
-
+  /** Core generation: respects skillsByName when choosing candidates */
   const generateSchedule = () => {
     const daysActive = activeDays;
     const next = {};
@@ -194,9 +215,9 @@ export default function App() {
       for (const d of daysActive) next[pos][d] = [];
     }
 
-    // lock VAL first
     const lockedVAL = employees.filter((e) => e.lockToVAL);
     let pool = shuffle(employees.filter((e) => !e.lockToVAL));
+
     for (const e of lockedVAL) {
       for (const d of daysActive) next["VAL"][d].push(e);
     }
@@ -204,20 +225,31 @@ export default function App() {
     const maxNeed = (pos) =>
       Math.max(...daysActive.map((d) => positionNeeds[pos]?.[d] || 0), 0);
 
-    // fill positions (skip VAL and OFF_POS)
     for (const pos of shuffle([...positionsList])) {
       if (pos === "VAL" || pos === OFF_POS) continue;
       const needed = maxNeed(pos);
       if (!needed) continue;
 
       const isAllowed = (e) => {
+        const cleanPos = pos;
+        const nameNorm = norm(e.name);
+        // skills rule: if row exists & value is explicitly false => block
+        const skillRow = skillsByName[nameNorm];
+        if (
+          skillRow &&
+          Object.prototype.hasOwnProperty.call(skillRow, cleanPos) &&
+          skillRow[cleanPos] === false
+        ) {
+          return false;
+        }
+        // restricted positions rule
         const name = e.name?.trim();
         if (
-          ["bulk", "line loading"].includes(norm(pos)) &&
+          ["bulk", "line loading"].includes(norm(cleanPos)) &&
           restrictedNames.includes(name)
         )
           return false;
-        if ((e.exclusions || []).map(norm).includes(norm(pos))) return false;
+        if ((e.exclusions || []).map(norm).includes(norm(cleanPos))) return false;
         return true;
       };
 
@@ -225,10 +257,13 @@ export default function App() {
         pool.filter(
           (e) =>
             isAllowed(e) &&
-            (norm(e.positions[0]) === norm(pos) ||
+            (
+              // soft preference (1st/2nd/3rd) still used as a preference
+              norm(e.positions[0]) === norm(pos) ||
               norm(e.positions[1]) === norm(pos) ||
               norm(e.positions[2]) === norm(pos) ||
-              e.positions.some((p) => norm(p) === "anything"))
+              e.positions.some((p) => norm(p) === "anything")
+            )
         )
       );
 
@@ -242,33 +277,43 @@ export default function App() {
       for (const d of daysActive) next[pos][d] = [...pick];
     }
 
-    // fill open slots with leftovers (skip OFF_POS)
+    // Fill remaining needs with leftovers, still respecting skills
     const openSlots = [];
     for (const pos of positionsList) {
       if (pos === OFF_POS) continue;
       for (const d of daysActive) {
         const need = positionNeeds[pos]?.[d] || 0;
-        const cur = next[pos][d].length;
-        if (cur < need) openSlots.push({ pos, day: d, remaining: need - cur });
+        const current = next[pos][d].length;
+        if (current < need)
+          openSlots.push({ pos, day: d, remaining: need - current });
       }
     }
     const leftovers = shuffle(pool);
     for (const emp of leftovers) {
+      const row = skillsByName[norm(emp.name)];
       for (const slot of openSlots) {
         if (slot.remaining <= 0) continue;
+        // skills check for leftovers
+        const allowedBySkills =
+          !row ||
+          !Object.prototype.hasOwnProperty.call(row, slot.pos) ||
+          row[slot.pos] !== false;
+        if (!allowedBySkills) continue;
+
         if (
           ["bulk", "line loading"].includes(norm(slot.pos)) &&
           restrictedNames.includes(emp.name?.trim())
         )
           continue;
         if ((emp.exclusions || []).map(norm).includes(norm(slot.pos))) continue;
+
         next[slot.pos][slot.day].push(emp);
         slot.remaining -= 1;
         break;
       }
     }
 
-    // weekly positionCounts (+1 per position that week; OFF ignored)
+    // weekly counts (+1 per position they appeared in across the week)
     setPositionCounts((prev) => {
       const base = ensureCountsShape(prev, employees);
       positionsList.forEach((pos) => {
@@ -289,8 +334,7 @@ export default function App() {
     setTab("schedule");
   };
 
-  /* Drag & drop: move, then adjust counts if position changed
-     (OFF/OTHER doesn’t count; leaving a real pos decrements if >0) */
+  /** Drag: move + adjust counts when pos changes */
   const handleDragEnd = (result) => {
     const { source, destination } = result;
     if (!destination) return;
@@ -303,23 +347,18 @@ export default function App() {
     const [moved] = next[s.pos][s.day].splice(source.index, 1);
     if (!moved) return;
 
-    // unique id per cell placement
     const uid = `${moved.id}-${d.pos}-${d.day}-${Date.now()}`;
     next[d.pos][d.day].splice(destination.index, 0, { ...moved, _uid: uid });
-
     setSchedule(next);
 
     if (s.pos !== d.pos) {
       setPositionCounts((prev) => {
         const base = ensureCountsShape(prev, employees);
         const name = moved.name;
-
-        if (s.pos !== OFF_POS && base[name][s.pos] > 0) {
+        if (s.pos !== OFF_POS && base[name][s.pos] > 0)
           base[name][s.pos] = base[name][s.pos] - 1;
-        }
-        if (d.pos !== OFF_POS) {
+        if (d.pos !== OFF_POS)
           base[name][d.pos] = (base[name][d.pos] || 0) + 1;
-        }
         return { ...base };
       });
     }
@@ -329,7 +368,11 @@ export default function App() {
     <div style={{ fontFamily: "Arial", background: "#f7f9fc", minHeight: "100vh" }}>
       <Header tab={tab} setTab={setTab} />
       {tab === "roster" ? (
-        <RosterTab employees={employees} setEmployees={setEmployees} />
+        <RosterTab
+          employees={employees}
+          setEmployees={setEmployees}
+          onImportSkills={(obj) => setSkillsByName(obj)}
+        />
       ) : (
         <ScheduleTab
           includeSaturday={includeSaturday}
@@ -348,7 +391,24 @@ export default function App() {
           generatedOnce={generatedOnce}
           schedule={schedule}
           setSchedule={setSchedule}
-          exportToExcel={exportToExcel}
+          exportToExcel={() => {
+            const wsData = [["Position", ...activeDays]];
+            positionsList.forEach((pos) => {
+              wsData.push([
+                pos,
+                ...activeDays.map((d) =>
+                  (schedule[pos]?.[d] || []).map((e) => e.name).join(", ")
+                ),
+              ]);
+            });
+            const ws = XLSX.utils.aoa_to_sheet(wsData);
+            const wb = XLSX.utils.book_new();
+            XLSX.utils.book_append_sheet(wb, ws, "Weekly Schedule");
+            XLSX.writeFile(
+              wb,
+              `Weekly_Schedule_${new Date().toISOString().split("T")[0]}.xlsx`
+            );
+          }}
           onDragEnd={handleDragEnd}
           positionCounts={ensureCountsShape(positionCounts, employees)}
         />
@@ -390,10 +450,11 @@ const tabBtn = (active) => ({
   cursor: "pointer",
 });
 
-/* ==================== UI: Roster ==================== */
-function RosterTab({ employees, setEmployees }) {
+/* ==================== UI: Roster (with Skills Import) ==================== */
+function RosterTab({ employees, setEmployees, onImportSkills }) {
   const [showPaste, setShowPaste] = useState(false);
   const [pasteText, setPasteText] = useState("");
+  const [importingSkills, setImportingSkills] = useState(false);
 
   const handlePasteRoster = () => {
     const lines = pasteText
@@ -420,23 +481,85 @@ function RosterTab({ employees, setEmployees }) {
     setPasteText("");
   };
 
+  const handleImportSkillsFile = async (file) => {
+    try {
+      const data = await file.arrayBuffer();
+      let rows = [];
+      if (file.name.toLowerCase().endsWith(".csv")) {
+        const text = new TextDecoder("utf-8").decode(new Uint8Array(data));
+        const wb = XLSX.read(text, { type: "string" });
+        rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], {
+          defval: "",
+        });
+      } else {
+        const wb = XLSX.read(data, { type: "array" });
+        rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], {
+          defval: "",
+        });
+      }
+
+      const updates = {};
+      for (const r of rows) {
+        const keys = Object.keys(r);
+        const nameKey =
+          keys.find((k) => norm(k) === "name") ||
+          keys.find((k) => norm(k) === "names") ||
+          keys.find((k) => norm(k) === "employee") ||
+          keys.find((k) => norm(k) === "employee name");
+        const name = nameKey ? String(r[nameKey]).trim() : "";
+        if (!name) continue;
+
+        const skillMap = {};
+        for (const k of keys) {
+          const target = headerToPosition(k);
+          if (!target || target === OFF_POS) continue;
+          const b = toBoolLike(r[k]);
+          if (b === null) continue; // unknown -> ignore
+          skillMap[target] = b;
+        }
+        updates[norm(name)] = skillMap;
+      }
+
+      onImportSkills(updates);
+      setImportingSkills(false);
+    } catch (e) {
+      console.error(e);
+      alert("Failed to import skills file. Please check the format.");
+    }
+  };
+
   return (
     <div style={{ padding: 20, maxWidth: 1000, margin: "0 auto" }}>
       <div style={{ display: "flex", justifyContent: "space-between" }}>
         <h3 style={{ color: BB_BLUE }}>Employee Roster</h3>
-        <button
-          onClick={() => setShowPaste(true)}
-          style={{
-            background: BB_YELLOW,
-            border: "none",
-            padding: "6px 12px",
-            borderRadius: 6,
-            fontWeight: "bold",
-            color: BB_BLUE,
-          }}
-        >
-          📋 Paste Full Roster
-        </button>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button
+            onClick={() => setImportingSkills(true)}
+            style={{
+              background: "white",
+              border: `1px solid ${LIGHT_BORDER}`,
+              padding: "6px 12px",
+              borderRadius: 6,
+              color: BB_BLUE,
+              fontWeight: "bold",
+            }}
+          >
+            Import Skills (.xlsx/.csv)
+          </button>
+          <button
+            onClick={() => setShowPaste(true)}
+            style={{
+              background: BB_YELLOW,
+              border: "none",
+              padding: "6px 12px",
+              borderRadius: 6,
+              fontWeight: "bold",
+              color: BB_BLUE,
+            }}
+          >
+            📋 Paste Full Roster
+          </button>
+        </div>
       </div>
 
       <table style={{ width: "100%", borderCollapse: "collapse", marginTop: 10 }}>
@@ -453,7 +576,7 @@ function RosterTab({ employees, setEmployees }) {
             <tr key={e.id}>
               <td>{e.name}</td>
               {e.positions.map((p, i) => (
-                <td key={`${e.id}-pos-${i}`}>
+                <td key={i}>
                   <input
                     value={p}
                     onChange={(ev) => {
@@ -477,6 +600,7 @@ function RosterTab({ employees, setEmployees }) {
         </tbody>
       </table>
 
+      {/* Roster paste modal */}
       {showPaste && (
         <div
           style={{
@@ -536,6 +660,56 @@ function RosterTab({ employees, setEmployees }) {
           </div>
         </div>
       )}
+
+      {/* Skills import modal */}
+      {importingSkills && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.4)",
+            display: "flex",
+            justifyContent: "center",
+            alignItems: "center",
+          }}
+        >
+          <div
+            style={{
+              background: "white",
+              padding: 20,
+              borderRadius: 8,
+              width: 420,
+            }}
+          >
+            <h3>Import Skills</h3>
+            <p style={{ marginTop: 0, color: "#666" }}>
+              Upload a CSV/XLSX with headers like: <br />
+              <code>Name, Receiving, Trade In, Direct Sort, Flow, Belt, Research, Val, Repack, Wrap, Line Loading, Bulk</code>
+              <br />
+              Values can be <strong>yes/no</strong>.
+            </p>
+            <input
+              type="file"
+              accept=".xlsx,.xls,.csv"
+              onChange={(e) => e.target.files?.[0] && handleImportSkillsFile(e.target.files[0])}
+            />
+            <div style={{ marginTop: 10, textAlign: "right" }}>
+              <button
+                onClick={() => setImportingSkills(false)}
+                style={{
+                  background: "white",
+                  color: BB_BLUE,
+                  border: `1px solid ${LIGHT_BORDER}`,
+                  padding: "6px 12px",
+                  borderRadius: 6,
+                }}
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -552,6 +726,7 @@ function ScheduleTab({
   resetChart,
   generatedOnce,
   schedule,
+  setSchedule,
   exportToExcel,
   onDragEnd,
   positionCounts,
@@ -616,7 +791,6 @@ function ScheduleTab({
         </div>
       </div>
 
-      {/* Needs (skip OFF/OTHER) */}
       <h3 style={{ color: BB_BLUE }}>
         Set Position Needs ({includeSaturday ? "Mon–Sat" : "Mon–Fri"})
       </h3>
@@ -624,13 +798,13 @@ function ScheduleTab({
         .filter((p) => p !== OFF_POS)
         .map((pos) => (
           <div
-            key={`need-${pos}`}
+            key={pos}
             style={{ display: "flex", alignItems: "center", marginBottom: 5 }}
           >
             <strong style={{ width: 150, textTransform: "capitalize" }}>{pos}</strong>
             {activeDays.map((d) => (
               <input
-                key={`need-${pos}-${d}`}
+                key={d}
                 type="number"
                 value={positionNeeds[pos]?.[d] || ""}
                 onChange={(e) => handleNeedChange(pos, d, e.target.value)}
@@ -640,7 +814,6 @@ function ScheduleTab({
           </div>
         ))}
 
-      {/* Schedule table */}
       {Object.keys(schedule).length > 0 && (
         <div style={{ marginTop: 20 }}>
           <div
@@ -680,18 +853,18 @@ function ScheduleTab({
                 <tr>
                   <th style={{ width: 150 }}>Position</th>
                   {activeDays.map((d) => (
-                    <th key={`day-${d}`}>{d}</th>
+                    <th key={d}>{d}</th>
                   ))}
                 </tr>
               </thead>
               <tbody>
                 {positionsList.map((pos) => (
-                  <tr key={`row-${pos}`}>
+                  <tr key={pos}>
                     <td>
                       <strong style={{ textTransform: "capitalize" }}>{pos}</strong>
                     </td>
                     {activeDays.map((day) => (
-                      <td key={`cell-${pos}-${day}`}>
+                      <td key={day}>
                         <Droppable droppableId={did(pos, day)}>
                           {(provided) => (
                             <div
@@ -705,37 +878,33 @@ function ScheduleTab({
                                 background: pos === OFF_POS ? "#fff9f0" : "#fff",
                               }}
                             >
-                              {(schedule[pos]?.[day] || []).map((emp, idx) => {
-                                const dragId =
-                                  emp._uid ?? `${emp.id}-${pos}-${day}-${idx}`;
-                                return (
-                                  <Draggable
-                                    key={`drag-${dragId}`}
-                                    draggableId={dragId}
-                                    index={idx}
-                                  >
-                                    {(prov) => (
-                                      <div
-                                        ref={prov.innerRef}
-                                        {...prov.draggableProps}
-                                        {...prov.dragHandleProps}
-                                        style={{
-                                          ...prov.draggableProps.style,
-                                          padding: "4px 6px",
-                                          marginBottom: 4,
-                                          background: "#f5f7ff",
-                                          border: `1px solid ${LIGHT_BORDER}`,
-                                          borderRadius: 4,
-                                          cursor: "grab",
-                                          fontSize: 13,
-                                        }}
-                                      >
-                                        {emp.name}
-                                      </div>
-                                    )}
-                                  </Draggable>
-                                );
-                              })}
+                              {(schedule[pos]?.[day] || []).map((emp, idx) => (
+                                <Draggable
+                                  key={(emp._uid ?? `${emp.id}-${pos}-${day}-${idx}`)}
+                                  draggableId={(emp._uid ?? `${emp.id}-${pos}-${day}-${idx}`)}
+                                  index={idx}
+                                >
+                                  {(prov) => (
+                                    <div
+                                      ref={prov.innerRef}
+                                      {...prov.draggableProps}
+                                      {...prov.dragHandleProps}
+                                      style={{
+                                        ...prov.draggableProps.style,
+                                        padding: "4px 6px",
+                                        marginBottom: 4,
+                                        background: "#f5f7ff",
+                                        border: `1px solid ${LIGHT_BORDER}`,
+                                        borderRadius: 4,
+                                        cursor: "grab",
+                                        fontSize: 13,
+                                      }}
+                                    >
+                                      {emp.name}
+                                    </div>
+                                  )}
+                                </Draggable>
+                              ))}
                               {provided.placeholder}
                             </div>
                           )}
@@ -748,7 +917,6 @@ function ScheduleTab({
             </table>
           </DragDropContext>
 
-          {/* Counts table */}
           <h3 style={{ marginTop: 24, color: BB_BLUE }}>Position Counts (per week)</h3>
           <div style={{ overflowX: "auto" }}>
             <table style={{ width: "100%", borderCollapse: "collapse" }}>
@@ -767,7 +935,7 @@ function ScheduleTab({
                     .filter((p) => p !== OFF_POS)
                     .map((p) => (
                       <th
-                        key={`hdr-count-${p}`}
+                        key={p}
                         style={{
                           textAlign: "center",
                           padding: 6,
@@ -782,7 +950,7 @@ function ScheduleTab({
               </thead>
               <tbody>
                 {Object.keys(positionCounts).map((name) => (
-                  <tr key={`row-count-${name}`}>
+                  <tr key={name}>
                     <td style={{ padding: 6, borderBottom: `1px solid ${LIGHT_BORDER}` }}>
                       {name}
                     </td>
@@ -790,7 +958,7 @@ function ScheduleTab({
                       .filter((p) => p !== OFF_POS)
                       .map((p) => (
                         <td
-                          key={`cell-count-${name}-${p}`}
+                          key={p}
                           style={{
                             textAlign: "center",
                             padding: 6,
