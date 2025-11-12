@@ -46,6 +46,15 @@ const parseDid = (id) => {
 };
 const shuffle = (arr) => [...arr].sort(() => Math.random() - 0.5);
 
+const defaultAvailability = () => ({
+  Mon: true,
+  Tue: true,
+  Wed: true,
+  Thu: true,
+  Fri: true,
+  Sat: false,
+});
+
 const initialEmployees = [
   { name: "Denise", positions: ["Receiving", "Direct Sorting", "Re-pack"] },
   { name: "Imelda", positions: ["Belt", "Flow", "Direct Sorting"] },
@@ -72,6 +81,8 @@ const initialEmployees = [
   id: i + 1,
   exclusions: [],
   lockToVAL: Boolean(e.lockToVAL),
+  availability: defaultAvailability(), // ✅ per-day availability
+  outThisWeek: false,                  // optional global out flag (still supported)
   ...e,
 }));
 
@@ -121,7 +132,19 @@ export default function App() {
 
   // load
   useEffect(() => {
-    setEmployees(JSON.parse(localStorage.getItem("employees")) || initialEmployees);
+    const savedEmployees =
+      JSON.parse(localStorage.getItem("employees")) || initialEmployees;
+
+    // ensure availability exists on old saves
+    const upgraded = savedEmployees.map((e) => ({
+      availability: defaultAvailability(),
+      outThisWeek: false,
+      ...e,
+      availability: e.availability || defaultAvailability(),
+      outThisWeek: e.outThisWeek || false,
+    }));
+
+    setEmployees(upgraded);
     setPositionNeeds(JSON.parse(localStorage.getItem("positionNeeds")) || {});
     setSchedule(JSON.parse(localStorage.getItem("schedule")) || {});
     setScheduleHistory(JSON.parse(localStorage.getItem("scheduleHistory")) || []);
@@ -155,7 +178,6 @@ export default function App() {
     setGeneratedOnce(false);
   };
 
-  // RESET CHART BUTTON handler
   const resetCounts = () => {
     setPositionCounts({});
     setScheduleHistory([]);
@@ -163,128 +185,122 @@ export default function App() {
     localStorage.removeItem("scheduleHistory");
   };
 
+  const clearWeeklyOutFlags = () => {
+    setEmployees((prev) => prev.map((e) => ({ ...e, outThisWeek: false })));
+  };
+
+  const isAllowedForPos = (e, pos) => {
+    const name = e.name?.trim();
+    if (
+      ["bulk", "line loading"].includes(norm(pos)) &&
+      restrictedNames.includes(name)
+    )
+      return false;
+    if ((e.exclusions || []).map(norm).includes(norm(pos))) return false;
+    return true;
+  };
+
   const generateSchedule = () => {
     const daysActive = activeDays;
+    // Build a fresh empty week structure
     const next = {};
-
-    // track who is already on each day
-    const dayTaken = {};
-    daysActive.forEach((d) => (dayTaken[d] = new Set()));
-
-    // init schedule shape
     for (const pos of positionsList) {
       next[pos] = {};
       for (const d of daysActive) next[pos][d] = [];
     }
 
-    // VAL locked first
+    // Day-by-day taken sets (avoid double-booking)
+    const dayTaken = {};
+    daysActive.forEach((d) => (dayTaken[d] = new Set()));
+
+    // Helper to get availability for a given day
+    const isAvailable = (e, day) =>
+      !e.outThisWeek && (e.availability?.[day] ?? true);
+
+    // 1) Place VAL locked (only if available that day)
     const lockedVAL = employees.filter((e) => e.lockToVAL);
-    let pool = shuffle(employees.filter((e) => !e.lockToVAL));
-
-    for (const e of lockedVAL) {
-      for (const d of daysActive) {
-        next["VAL"][d].push(e);
-        dayTaken[d].add(e.name);
-      }
-    }
-
-    const maxNeed = (pos) =>
-      Math.max(...daysActive.map((d) => positionNeeds[pos]?.[d] || 0), 0);
-
-    // assign other positions
-    for (const pos of shuffle([...positionsList])) {
-      if (pos === "VAL") continue;
-      const needed = maxNeed(pos);
-      if (!needed) continue;
-
-      const isAllowedBase = (e) => {
-        const name = e.name?.trim();
-        if (
-          ["bulk", "line loading"].includes(norm(pos)) &&
-          restrictedNames.includes(name)
-        )
-          return false;
-        if ((e.exclusions || []).map(norm).includes(norm(pos))) return false;
-        return true;
-      };
-
-      const isFreeAllDays = (e) =>
-        daysActive.every((d) => !dayTaken[d].has(e.name));
-
-      // best candidates
-      let candidates = pool.filter(
-        (e) =>
-          isAllowedBase(e) &&
-          isFreeAllDays(e) &&
-          !wasInPositionRecently(e.name, pos, scheduleHistory, LOOKBACK_WEEKS)
-      );
-
-      // relax if not enough
-      if (candidates.length < needed) {
-        const more = pool.filter((e) => isAllowedBase(e) && isFreeAllDays(e));
-        more.forEach((m) => {
-          if (!candidates.includes(m)) candidates.push(m);
-        });
-      }
-
-      // score by preference
-      const scored = candidates.map((e) => {
-        const idx = e.positions.map(norm).indexOf(norm(pos));
-        return { emp: e, score: idx === -1 ? 99 : idx };
-      });
-      scored.sort((a, b) => a.score - b.score);
-
-      const picked = scored.slice(0, needed).map((x) => x.emp);
-
-      // assign for all days
-      for (const d of daysActive) {
-        next[pos][d] = [...picked];
-        picked.forEach((p) => dayTaken[d].add(p.name));
-      }
-
-      // remove picked from pool
-      pool = pool.filter((e) => !picked.some((p) => p.id === e.id));
-    }
-
-    // fill remaining
-    const openSlots = [];
-    for (const pos of positionsList) {
-      for (const d of daysActive) {
-        const need = positionNeeds[pos]?.[d] || 0;
-        const current = next[pos][d].length;
-        if (current < need) {
-          openSlots.push({ pos, day: d, remaining: need - current });
+    for (const d of daysActive) {
+      lockedVAL.forEach((e) => {
+        if (isAvailable(e, d)) {
+          next["VAL"][d].push(e);
+          dayTaken[d].add(e.name);
         }
+      });
+    }
+
+    // Create base pool (non-VAL)
+    const nonLocked = shuffle(employees.filter((e) => !e.lockToVAL));
+
+    // 2) For each day, for each position, fill by need
+    for (const d of daysActive) {
+      for (const pos of shuffle([...positionsList])) {
+        if (pos === "VAL") continue;
+        const need = positionNeeds[pos]?.[d] || 0;
+        const already = next[pos][d].length;
+        let remaining = Math.max(0, need - already);
+        if (remaining === 0) continue;
+
+        // Base candidates: available this day, not already taken this day, allowed for pos
+        const baseCands = nonLocked.filter(
+          (e) =>
+            isAvailable(e, d) &&
+            !dayTaken[d].has(e.name) &&
+            isAllowedForPos(e, pos)
+        );
+
+        // First try: not recently in this position (LOOKBACK_WEEKS), best preference first
+        const primary = baseCands
+          .filter(
+            (e) => !wasInPositionRecently(e.name, pos, scheduleHistory, LOOKBACK_WEEKS)
+          )
+          .map((e) => {
+            const idx = e.positions.map(norm).indexOf(norm(pos));
+            return { emp: e, score: idx === -1 ? 99 : idx };
+          })
+          .sort((a, b) => a.score - b.score)
+          .map((x) => x.emp);
+
+        const picks = [];
+
+        for (const cand of primary) {
+          if (remaining <= 0) break;
+          picks.push(cand);
+          dayTaken[d].add(cand.name);
+          remaining--;
+        }
+
+        if (remaining > 0) {
+          // Relax "recently" rule but still prefer by preference
+          const secondary = baseCands
+            .filter((e) => !picks.includes(e))
+            .map((e) => {
+              const idx = e.positions.map(norm).indexOf(norm(pos));
+              return { emp: e, score: idx === -1 ? 99 : idx };
+            })
+            .sort((a, b) => a.score - b.score)
+            .map((x) => x.emp);
+
+          for (const cand of secondary) {
+            if (remaining <= 0) break;
+            picks.push(cand);
+            dayTaken[d].add(cand.name);
+            remaining--;
+          }
+        }
+
+        next[pos][d].push(...picks);
       }
     }
 
-    const leftovers = shuffle(pool);
-    for (const emp of leftovers) {
-      for (const slot of openSlots) {
-        if (slot.remaining <= 0) continue;
-        if (dayTaken[slot.day].has(emp.name)) continue;
-        if (
-          ["bulk", "line loading"].includes(norm(slot.pos)) &&
-          restrictedNames.includes(emp.name?.trim())
-        )
-          continue;
-        if ((emp.exclusions || []).map(norm).includes(norm(slot.pos))) continue;
-        next[slot.pos][slot.day].push(emp);
-        dayTaken[slot.day].add(emp.name);
-        slot.remaining -= 1;
-        break;
-      }
-    }
-
-    // save schedule
+    // Save schedule
     setSchedule(next);
     setGeneratedOnce(true);
 
-    // history (last 6)
+    // Update history (keep last 6)
     const newHistory = [...scheduleHistory, next].slice(-6);
     setScheduleHistory(newHistory);
 
-    // counts: +1 per week per position (unique names per position)
+    // Update counts: +1 per week per position for unique names who appeared any day this week
     setPositionCounts((prev) => {
       const base = ensureCountsShape(prev, employees);
       positionsList.forEach((pos) => {
@@ -344,16 +360,14 @@ export default function App() {
     next[dst.pos][dst.day].splice(destination.index, 0, moved);
     setSchedule(next);
 
-    // if position changed, adjust counts
+    // If position changed, adjust counts live
     if (src.pos !== dst.pos) {
       setPositionCounts((prev) => {
         const base = ensureCountsShape(prev, employees);
         const name = moved.name;
-        // -1 from old if >0
         if ((base[name][src.pos] || 0) > 0) {
           base[name][src.pos] = base[name][src.pos] - 1;
         }
-        // +1 to new
         base[name][dst.pos] = (base[name][dst.pos] || 0) + 1;
         return { ...base };
       });
@@ -366,7 +380,10 @@ export default function App() {
     <div style={{ fontFamily: "Arial", background: "#f7f9fc", minHeight: "100vh" }}>
       <Header tab={tab} setTab={setTab} />
       {tab === "roster" ? (
-        <RosterTab employees={employees} setEmployees={setEmployees} />
+        <RosterTab
+          employees={employees}
+          setEmployees={setEmployees}
+        />
       ) : (
         <ScheduleTab
           includeSaturday={includeSaturday}
@@ -382,6 +399,7 @@ export default function App() {
           generateSchedule={generateSchedule}
           resetSchedule={resetSchedule}
           resetCounts={resetCounts}
+          clearWeeklyOutFlags={clearWeeklyOutFlags}
           generatedOnce={generatedOnce}
           schedule={schedule}
           exportToExcel={exportToExcel}
@@ -446,6 +464,8 @@ function RosterTab({ employees, setEmployees }) {
         ],
         exclusions: [],
         lockToVAL: ["sid", "rocha"].includes(norm(name)),
+        availability: defaultAvailability(), // default; you can edit below
+        outThisWeek: false,
       };
     });
     setEmployees(parsed);
@@ -453,8 +473,24 @@ function RosterTab({ employees, setEmployees }) {
     setPasteText("");
   };
 
+  const toggleAvail = (empId, day) => {
+    setEmployees((prev) =>
+      prev.map((e) =>
+        e.id === empId
+          ? { ...e, availability: { ...e.availability, [day]: !e.availability?.[day] } }
+          : e
+      )
+    );
+  };
+
+  const toggleOutThisWeek = (empId) => {
+    setEmployees((prev) =>
+      prev.map((e) => (e.id === empId ? { ...e, outThisWeek: !e.outThisWeek } : e))
+    );
+  };
+
   return (
-    <div style={{ padding: 20, maxWidth: 1000, margin: "0 auto" }}>
+    <div style={{ padding: 20, maxWidth: 1100, margin: "0 auto" }}>
       <div style={{ display: "flex", justifyContent: "space-between" }}>
         <h3 style={{ color: BB_BLUE }}>Employee Roster</h3>
         <button
@@ -472,45 +508,66 @@ function RosterTab({ employees, setEmployees }) {
         </button>
       </div>
 
-      <table
-        style={{ width: "100%", borderCollapse: "collapse", marginTop: 10 }}
-      >
-        <thead style={{ background: BB_BLUE, color: "white" }}>
-          <tr>
-            <th>Name</th>
-            <th>1st</th>
-            <th>2nd</th>
-            <th>3rd</th>
-          </tr>
-        </thead>
-        <tbody>
-          {employees.map((e) => (
-            <tr key={e.id}>
-              <td>{e.name}</td>
-              {e.positions.map((p, i) => (
-                <td key={i}>
-                  <input
-                    value={p}
-                    onChange={(ev) => {
-                      const updated = employees.map((emp) =>
-                        emp.id === e.id
-                          ? {
-                              ...emp,
-                              positions: emp.positions.map((x, j) =>
-                                j === i ? ev.target.value : x
-                              ),
-                            }
-                          : emp
-                      );
-                      setEmployees(updated);
-                    }}
-                  />
-                </td>
+      <div style={{ overflowX: "auto" }}>
+        <table style={{ width: "100%", borderCollapse: "collapse", marginTop: 10 }}>
+          <thead style={{ background: BB_BLUE, color: "white" }}>
+            <tr>
+              <th>Name</th>
+              <th>1st</th>
+              <th>2nd</th>
+              <th>3rd</th>
+              <th>Out (week)</th>
+              {BASE_DAYS.map((d) => (
+                <th key={d}>{d}</th>
               ))}
             </tr>
-          ))}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {employees.map((e) => (
+              <tr key={e.id}>
+                <td>{e.name}</td>
+                {e.positions.map((p, i) => (
+                  <td key={i}>
+                    <input
+                      value={p}
+                      onChange={(ev) => {
+                        const updated = employees.map((emp) =>
+                          emp.id === e.id
+                            ? {
+                                ...emp,
+                                positions: emp.positions.map((x, j) =>
+                                  j === i ? ev.target.value : x
+                                ),
+                              }
+                            : emp
+                        );
+                        setEmployees(updated);
+                      }}
+                    />
+                  </td>
+                ))}
+                <td style={{ textAlign: "center" }}>
+                  <input
+                    type="checkbox"
+                    checked={!!e.outThisWeek}
+                    onChange={() => toggleOutThisWeek(e.id)}
+                  />
+                </td>
+                {BASE_DAYS.map((d) => (
+                  <td key={d} style={{ textAlign: "center" }}>
+                    <input
+                      type="checkbox"
+                      checked={!!e.availability?.[d]}
+                      onChange={() => toggleAvail(e.id, d)}
+                      title={`Available on ${d}`}
+                    />
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
 
       {showPaste && (
         <div
@@ -528,10 +585,13 @@ function RosterTab({ employees, setEmployees }) {
               background: "white",
               padding: 20,
               borderRadius: 8,
-              width: 400,
+              width: 420,
             }}
           >
             <h3>Paste Roster (comma/tab separated)</h3>
+            <p style={{ marginTop: 6, color: "#555", fontSize: 13 }}>
+              Format: <code>Name, FirstChoice, SecondChoice, ThirdChoice</code>
+            </p>
             <textarea
               rows={8}
               value={pasteText}
@@ -582,6 +642,7 @@ function ScheduleTab({
   generateSchedule,
   resetSchedule,
   resetCounts,
+  clearWeeklyOutFlags,
   generatedOnce,
   schedule,
   exportToExcel,
@@ -609,7 +670,7 @@ function ScheduleTab({
           </span>
         </label>
 
-        <div style={{ display: "flex", gap: 10 }}>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
           <button
             onClick={resetSchedule}
             style={{
@@ -635,6 +696,19 @@ function ScheduleTab({
             }}
           >
             Reset Chart
+          </button>
+          <button
+            onClick={clearWeeklyOutFlags}
+            style={{
+              background: "white",
+              border: `1px solid ${LIGHT_BORDER}`,
+              color: "#444",
+              padding: "6px 10px",
+              borderRadius: 6,
+              fontWeight: "bold",
+            }}
+          >
+            Clear “Out this week”
           </button>
           <button
             onClick={generateSchedule}
